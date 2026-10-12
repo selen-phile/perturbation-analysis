@@ -175,7 +175,7 @@ def get_doc_col(schema):
 
 
 # ============================================================
-# CACHE HIDDEN STATES
+# CACHE MLP-INPUT ACTIVATIONS (mlp_in)
 # ============================================================
 
 def cache_hidden_states(
@@ -186,160 +186,94 @@ def cache_hidden_states(
     schema,
     target_layers,
 ):
-    """
-    Run the LLM once for each clean query and once for each
-    perturbation condition.
+    """Cache MLP-input (mlp_in) activations for clean and noisy prompts.
+
+    A forward-pre-hook captures input[0] to each target layer's MLP,
+    matching the activation site used by mlp_extractor.py during
+    transcoder training. Activations are stored on CPU as float16.
 
     Returns:
-
         clean_cache[layer][sample_id]
         noisy_cache[layer][condition][sample_id]
-
-    Hidden states are stored on CPU as float16 to reduce memory.
     """
-
     doc_col = get_doc_col(schema)
+    num_samples = min(len(df_test), len(df_robust))
 
-    num_samples = min(
-        len(df_test),
-        len(df_robust)
-    )
+    print(f"Caching MLP-input activations (site=mlp_in) for {num_samples} samples...")
 
-    print(
-        f"Caching hidden states for "
-        f"{num_samples} samples..."
-    )
-
-    clean_cache = {
-        layer: {}
-        for layer in target_layers
-    }
-
+    clean_cache = {layer: {} for layer in target_layers}
     noisy_cache = {
-        layer: {
-            cond: {}
-            for cond in NOISE_CONDITIONS
-        }
+        layer: {cond: {} for cond in NOISE_CONDITIONS}
         for layer in target_layers
     }
+
+    # Capture the input tensor passed into each target MLP.
+    captured = {}
+    handles = []
+
+    def make_pre_hook(layer_idx):
+        def hook_fn(module, inputs):
+            if not inputs:
+                raise RuntimeError(f"No inputs captured for MLP layer {layer_idx}")
+            captured[layer_idx] = inputs[0].detach()
+        return hook_fn
+
+    for layer_idx in target_layers:
+        mlp_module = model.model.layers[layer_idx].mlp
+        handles.append(
+            mlp_module.register_forward_pre_hook(make_pre_hook(layer_idx))
+        )
 
     device = next(model.parameters()).device
 
-    with torch.no_grad():
+    def run_and_cache(prompt, sample_id, condition=None):
+        captured.clear()
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        ).to(device)
 
-        for i in range(num_samples):
+        _ = model(**inputs)
 
-            doc = str(
-                df_test.loc[i, doc_col]
-            )
-
-            # ------------------------------------------------
-            # CLEAN QUERY
-            # ------------------------------------------------
-
-            clean_query = str(
-                df_robust.loc[i, "original_query"]
-            )
-
-            clean_prompt = build_prompt(
-                schema,
-                doc,
-                clean_query
-            )
-
-            clean_inputs = tokenizer(
-                clean_prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512
-            ).to(device)
-
-            clean_out = model(
-                **clean_inputs,
-                output_hidden_states=True
-            )
-
-            for layer in target_layers:
-
-                # hidden_states[0] = embedding output
-                # hidden_states[layer + 1] = transformer block output
-                h = clean_out.hidden_states[
-                    layer + 1
-                ]
-
-                h = (
-                    h.squeeze(0)
-                    [:SEQ_TRUNCATE]
-                    .to(torch.float16)
-                    .cpu()
+        for layer_idx in target_layers:
+            if layer_idx not in captured:
+                raise RuntimeError(
+                    f"MLP-input hook did not fire for layer {layer_idx}."
                 )
+            h = captured[layer_idx].squeeze(0)[:SEQ_TRUNCATE]
+            h = h.to(torch.float16).cpu()
+            if condition is None:
+                clean_cache[layer_idx][sample_id] = h
+            else:
+                noisy_cache[layer_idx][condition][sample_id] = h
 
-                clean_cache[layer][i] = h
+        del inputs
 
-            del clean_inputs
-            del clean_out
+    try:
+        model.eval()
+        with torch.no_grad():
+            for i in range(num_samples):
+                doc = str(df_test.loc[i, doc_col])
+                clean_query = str(df_robust.loc[i, "original_query"])
+                clean_prompt = build_prompt(schema, doc, clean_query)
+                run_and_cache(clean_prompt, i)
 
-            # ------------------------------------------------
-            # NOISY QUERIES
-            # ------------------------------------------------
+                for cond in NOISE_CONDITIONS:
+                    noisy_query = str(df_robust.loc[i, cond])
+                    noisy_prompt = build_prompt(schema, doc, noisy_query)
+                    run_and_cache(noisy_prompt, i, condition=cond)
 
-            for cond in NOISE_CONDITIONS:
+                if i % 100 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print(f"    [{i}/{num_samples}]")
+    finally:
+        for handle in handles:
+            handle.remove()
 
-                noisy_query = str(
-                    df_robust.loc[i, cond]
-                )
-
-                noisy_prompt = build_prompt(
-                    schema,
-                    doc,
-                    noisy_query
-                )
-
-                noisy_inputs = tokenizer(
-                    noisy_prompt,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=512
-                ).to(device)
-
-                noisy_out = model(
-                    **noisy_inputs,
-                    output_hidden_states=True
-                )
-
-                for layer in target_layers:
-
-                    h = noisy_out.hidden_states[
-                        layer + 1
-                    ]
-
-                    h = (
-                        h.squeeze(0)
-                        [:SEQ_TRUNCATE]
-                        .to(torch.float16)
-                        .cpu()
-                    )
-
-                    noisy_cache[
-                        layer
-                    ][cond][i] = h
-
-                del noisy_inputs
-                del noisy_out
-
-            if i % 100 == 0:
-
-                torch.cuda.empty_cache()
-
-                print(
-                    f"    [{i}/{num_samples}]"
-                )
-
-    return (
-        clean_cache,
-        noisy_cache,
-        num_samples
-    )
+    return clean_cache, noisy_cache, num_samples
 
 
 # ============================================================
